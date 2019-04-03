@@ -17,7 +17,11 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"math/rand"
+	"sync"
+	"time"
+)
 import "labrpc"
 
 // import "bytes"
@@ -49,12 +53,25 @@ type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	me        int                 // this peer's index into peers[] 当前结点在peers中的编号
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentState int // 0:leader 1:Follower 2:candidate
+    currentTerm int
+	//isLeader bool    //自己是不是leader
+	votedFor int  //当前term已经投票的候选人，在新的term应该要先置空，收不到leader心跳，会变为选举时间，此时voteFor会变为0
+	peerCount int //总共有多少结点
+    log[]  raftlog //暂时不用
+    commitLogIndex int //已经commit的日志的index
+    applyLogIndex int //已经应用的日志的index
 
+}
+
+type raftlog struct {
+    op int
+    term int
 }
 
 // return currentTerm and whether this server
@@ -64,7 +81,13 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+    term = rf.currentTerm
+    if rf.currentState == 0{
+    	isleader = true
+	}else{
+		isleader = false
+	}
+    return term, isleader
 }
 
 
@@ -116,6 +139,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	term int //当前的term
+	candidateID int //当前自己的id？
+	lastLogIndex int//候选人最后的日志index
+	lastLogTerm int //候选人最后一条日志的term
 }
 
 //
@@ -124,13 +151,40 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	//收到投票的回复
+	term int //当前的term，给候选人更新自己的term（如果候选人比follower的term还小的话）
+	voteGranted bool // true同意投票，false不同意投票
 }
 
 //
 // example RequestVote RPC handler.
-//
+//这个应该是被调用的rpc？所以要吧回复写在RequestVoteReply。。。好吧
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+    //是否投票？
+    //1.term是否比自己的大或者相等
+    //2.日志比我新我才投票
+    if rf.votedFor != 0{
+        //已经投过票
+		reply.term = rf.currentTerm
+		reply.voteGranted = false
+		return
+	}
+    if args.term < rf.currentTerm{
+    	reply.term = rf.currentTerm
+    	reply.voteGranted = false
+    	return
+	} else if args.lastLogIndex < rf.commitLogIndex{
+		reply.term = rf.currentTerm
+		reply.voteGranted = false
+		return
+	}
+
+    //正式投票
+	reply.term = rf.currentTerm
+	reply.voteGranted = true
+	rf.votedFor = args.candidateID
+	return
 }
 
 //
@@ -163,8 +217,35 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	//调用别人的函数，rpc来获得投票
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRPC, reply *AppendEntriesReply) bool {
+	//调用别人的函数，rpc来获得投票
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+//follower被leader调用此函数传送心跳
+func AppendEntries ( args *AppendEntriesRPC, reply *AppendEntriesReply){
+    //刷新计时器
+}
+
+type AppendEntriesReply struct {
+	term int   //当前的任期号
+	success bool //跟随者包含了匹配上的prevLogIndex和prevLogTerm的日志时为真
+}
+
+type AppendEntriesRPC struct{
+	term int
+	leaderID int
+	prevLogIndex int
+	prevLogTerm int
+	entries[] raftlog
+	leaderCommit int
+
 }
 
 
@@ -222,10 +303,78 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	// Your data here (2A, 2B, 2C).
+	// Look at the paper's Figure 2 for a description of what
+	// state a Raft server must maintain.
+	rf.currentState = 1 // 0:leader 1:Follower 2:candidate
+	rf.currentTerm = 0
+	//isLeader bool    //自己是不是leader
+	rf.votedFor = 0  //当前term已经投票的候选人，在新的term应该要先置空
+	rf.peerCount = len(peers)  //总共有多少结点
+	 //暂时不用
+	rf.commitLogIndex = 0 //已经commit的日志的index
+	rf.applyLogIndex = 0 //已经应用的日志的index
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+//结点先创建，当第一个term结束/或者当前term为0，就转变为candidate来发起投票
 
 	return rf
 }
+
+func GoToElection(rf *Raft){
+	//1. election clock, random value
+	//设置定时器参数，若收到RPC，则销毁已经存在的定时器
+	//若定时器醒来，则转为候选人开始选举
+
+	//timeout: convert itself to candidate
+}
+
+func main_route(rf *Raft){
+
+}
+
+func GetRandNum() int{
+	r:=rand.New(rand.NewSource(time.Now().UnixNano()))
+	return r.Intn(230)
+}
+//
+//fmt.Println()
+//r:=rand.New(rand.NewSource(time.Now().UnixNano()))
+//fmt.Print(r.Intn(230))
+////var name string
+////fmt.Scanf("%s", &name)
+////fmt.Print(name)
+//timer := time.NewTimer(10 * time.Second)
+//
+//stopChannel := make(chan int)
+//go timed(timer,stopChannel)
+//
+//
+//var name string
+//for true {
+//fmt.Scanf("%s", &name)
+//
+//if name == "hao" {
+//close(stopChannel)
+//timer.Stop()
+//}
+//}
+//}
+//
+//func timed( t *time.Timer, stopChannel chan int) {
+//
+//	//chf:= make(chan int)
+//	go func() {
+//		select{
+//		case <-t.C:
+//			fmt.Println("子协程可以打印了，因为定时器的时间到")
+//		case <-stopChannel: //新增加一个关闭标志，如果是这个关闭，则直接return
+//			//ch <- 1
+//			return
+//		}
+//	}()
+//	//等待完成
+//	//<-chf
+//	fmt.Print("finish")
+//
+//}
