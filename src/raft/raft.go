@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -58,7 +59,7 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentState int // 0:leader 1:Follower 2:candidate
+	currentState int // 1:follower 2:leader 3:candidate
     currentTerm int
 	//isLeader bool    //自己是不是leader
 	votedFor int  //当前term已经投票的候选人，在新的term应该要先置空，收不到leader心跳，会变为选举时间，此时voteFor会变为0
@@ -66,8 +67,17 @@ type Raft struct {
     log[]  raftlog //暂时不用
     commitLogIndex int //已经commit的日志的index
     applyLogIndex int //已经应用的日志的index
+	electionTimerChannel chan int //used to election timeout
+	rpcTimeoutChannel chan int //used to rpc timeout
 
 }
+
+const (
+ FOLLOWER = 1
+ LEADER = 2
+ CANDIDATE int = 3
+)
+
 
 type raftlog struct {
     op int
@@ -82,14 +92,27 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
     term = rf.currentTerm
-    if rf.currentState == 0{
+    if rf.currentState == LEADER{
     	isleader = true
 	}else{
 		isleader = false
 	}
+	fmt.Println("return State!",rf.me,"current term", rf.currentTerm, mapState(rf.currentState), isleader)
     return term, isleader
 }
 
+func mapState(state int)string{
+	switch state {
+	case 1:
+		return "follower"
+	case 2:
+		return "leader"
+	case 3:
+		return "candidate"
+
+	}
+	return "wrong"
+}
 
 //
 // save Raft's persistent state to stable storage,
@@ -139,10 +162,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term int //当前的term
-	candidateID int //当前自己的id？
-	lastLogIndex int//候选人最后的日志index
-	lastLogTerm int //候选人最后一条日志的term
+	Term int //当前的term
+	CandidateID int //当前自己的id？
+	LastLogIndex int//候选人最后的日志index
+	LastLogTerm int //候选人最后一条日志的term
 }
 
 //
@@ -152,8 +175,8 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	// Your data here (2A).
 	//收到投票的回复
-	term int //当前的term，给候选人更新自己的term（如果候选人比follower的term还小的话）
-	voteGranted bool // true同意投票，false不同意投票
+	Term int //当前的term，给候选人更新自己的term（如果候选人比follower的term还小的话）
+	VoteGranted bool // true同意投票，false不同意投票
 }
 
 //
@@ -164,26 +187,33 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     //是否投票？
     //1.term是否比自己的大或者相等
     //2.日志比我新我才投票
-    if rf.votedFor != 0{
+     rf.mu.Lock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		rf.mu.Unlock()
+		return
+	}else if rf.votedFor != 0{
         //已经投过票
-		reply.term = rf.currentTerm
-		reply.voteGranted = false
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		rf.mu.Unlock()
+		return
+	} else if args.LastLogIndex < rf.commitLogIndex{
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		rf.mu.Unlock()
+		return
+	}else{
+		//正式投票
+		rf.votedFor = args.CandidateID
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = true
+		fmt.Println(rf.me,"term:",rf.currentTerm,"vote for",args.CandidateID)
+		rf.mu.Unlock()
 		return
 	}
-    if args.term < rf.currentTerm{
-    	reply.term = rf.currentTerm
-    	reply.voteGranted = false
-    	return
-	} else if args.lastLogIndex < rf.commitLogIndex{
-		reply.term = rf.currentTerm
-		reply.voteGranted = false
-		return
-	}
-
-    //正式投票
-	reply.term = rf.currentTerm
-	reply.voteGranted = true
-	rf.votedFor = args.candidateID
+	rf.mu.Unlock()
 	return
 }
 
@@ -222,30 +252,48 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRPC, reply *AppendEntriesReply) bool {
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	//调用别人的函数，rpc来获得投票
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	ok := rf.peers[server].Call("Raft.AppendEntriesRPC", args, reply)
 	return ok
 }
 
 //follower被leader调用此函数传送心跳
-func AppendEntries ( args *AppendEntriesRPC, reply *AppendEntriesReply){
+func (rf *Raft)AppendEntriesRPC ( args *AppendEntriesArgs, reply *AppendEntriesReply){
     //刷新计时器
+    //如果RPC的请求或者回复的term大于自己，那么自己就转变为FOLLOWER
+	rf.mu.Lock()
+    if args.Term < rf.currentTerm{
+    	reply.Term = rf.currentTerm
+    	reply.Success = false
+        return
+	} else{
+		//只做当选处理
+		fmt.Println(rf.me,"leaderID", args.LeaderID)
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		//if rf.currentState == CANDIDATE{
+		rf.currentState = FOLLOWER
+		rf.electionTimerChannel <- 1
+		rf.currentTerm = args.Term
+		rf.rpcTimeoutChannel <- 1
+		//}
+	}
+	rf.mu.Unlock()
 }
 
 type AppendEntriesReply struct {
-	term int   //当前的任期号
-	success bool //跟随者包含了匹配上的prevLogIndex和prevLogTerm的日志时为真
+	Term int   //当前的任期号
+	Success bool //跟随者包含了匹配上的prevLogIndex和prevLogTerm的日志时为真
 }
 
-type AppendEntriesRPC struct{
-	term int
-	leaderID int
-	prevLogIndex int
-	prevLogTerm int
-	entries[] raftlog
-	leaderCommit int
-
+type AppendEntriesArgs struct{
+	Term int
+	LeaderID int
+	//PrevLogIndex int
+	//PrevLogTerm int
+	//Entries[] raftlog
+	//LeaderCommit int
 }
 
 
@@ -301,12 +349,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
 	// Your initialization code here (2A, 2B, 2C).
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	rf.currentState = 1 // 0:leader 1:Follower 2:candidate
+	rf.currentState = FOLLOWER // 1:follower 2: leader  2:candidate
 	rf.currentTerm = 0
 	//isLeader bool    //自己是不是leader
 	rf.votedFor = 0  //当前term已经投票的候选人，在新的term应该要先置空
@@ -314,28 +361,216 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	 //暂时不用
 	rf.commitLogIndex = 0 //已经commit的日志的index
 	rf.applyLogIndex = 0 //已经应用的日志的index
+	rf.electionTimerChannel = make(chan int)
+	rf.rpcTimeoutChannel = make(chan int)
+
+	var rl raftlog
+	rl.term = 0
+	rl.op = 0
+	rf.log= make([]raftlog, 0, 100)
+	rf.log = append(rf.log, rl)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 //结点先创建，当第一个term结束/或者当前term为0，就转变为candidate来发起投票
-
+    go main_route(rf)
 	return rf
 }
+//func timed( t *time.Timer, stopChannel chan int) {
+//
+//	//chf:= make(chan int)
+//	go func() {
+//		select {
+//		case <-t.C:
+//			fmt.Println("子协程可以打印了，因为定时器的时间到")
+//		case <-stopChannel: //新增加一个关闭标志，如果是这个关闭，则直接return
+//			//ch <- 1
+//			return
+//		}
+//	}()
+//
+//	//等待完成
+//	//<-chf
+//}
 
 func GoToElection(rf *Raft){
 	//1. election clock, random value
-	//设置定时器参数，若收到RPC，则销毁已经存在的定时器
-	//若定时器醒来，则转为候选人开始选举
+	rf.mu.Lock()
+	rf.votedFor = 0
+	rf.mu.Unlock()
+	//chf:= make(chan int)
+	//t := time.NewTimer(time.Duration(GetRandNum()) * time.Millisecond)
+	select {
+		case <-time.After(time.Duration(GetRandNum()) * time.Millisecond):
+			//定时器时间到了，没收到回复，转为candidate
+			for{
+				fmt.Println(rf.me,rf.currentTerm)
+				if candidateElection(rf){
+					//收到新leader信息或者称为leader
+					fmt.Println(rf.me,"my State", mapState(rf.currentState))
+					break
+				}
+			}
 
-	//timeout: convert itself to candidate
+		case <-rf.electionTimerChannel: //新增加一个关闭标志，如果是这个关闭，则直接return，推出协程
+		    //1、收到投票信息并投出去了 2、收到新leader信息
+			//chf <- 0
+			fmt.Println(rf.me,rf.currentTerm,rf.votedFor)
+			return
+	}
+}
+
+
+//选举失败返回 false
+//成为follower或者成为leader 返回ok
+func candidateElection(rf * Raft) bool{
+	rf.mu.Lock()
+	rf.currentTerm += 1
+	rf.currentState = CANDIDATE
+	rf.votedFor = rf.me
+	rf.mu.Unlock()
+
+	//chf:= make(chan int)
+	//启动收集选票线程
+	electchan := make(chan int)
+	go func(rf *Raft, electchan chan int){
+		var rvags RequestVoteArgs
+        var reply RequestVoteReply
+		fmt.Println(rf.me,"go into election, currnet term:", rf.currentTerm)
+		rf.mu.Lock()
+		rvags.Term = rf.currentTerm
+		rvags.CandidateID = rf.me
+		rvags.LastLogIndex = rf.commitLogIndex
+		rvags.LastLogTerm = rf.log[rf.commitLogIndex].term
+		rf.mu.Unlock()
+        reply.VoteGranted = false
+        reply.Term = 0
+        //算上自己的一票。。。
+		voteCount:=1
+		//fmt.Println("go into vote",rf.me, rf.currentTerm)
+		for i:=0; i < rf.peerCount;i++{
+			if i != rf.me && rf.sendRequestVote(i, &rvags, &reply){
+				fmt.Println(rf.me, "recvone from",i, reply.VoteGranted,"term",reply.Term)
+				if reply.VoteGranted{
+					voteCount += 1
+				}
+			}
+
+			if voteCount > rf.peerCount / 2{
+				//宣布当选
+				//fmt.Println("go leader1",rf.me, voteCount,rf.currentTerm)
+				electchan <- 1
+				//break
+			}
+		}
+	}(rf, electchan)
+	select {
+		case <-time.After(time.Duration(GetRandNum()) * time.Millisecond):
+			//定时器时间到了，没收到回复或者成功当选leader
+			fmt.Println(rf.me,"candidate time out")
+			return false
+		case <-rf.electionTimerChannel: //新增加一个关闭标志，如果是这个关闭，则直接return，推出协程
+			//1、收到投票信息并投出去了 2、收到新leader信息
+			//handle directly in rpc
+			fmt.Println(rf.me,"has vote!exit candidate, term:", rf.currentTerm)
+			return true
+	    case <-electchan:
+	    	//当选为leader
+            var aerpc AppendEntriesArgs
+			fmt.Println(rf.me,"go leader, term:",rf.currentTerm)
+	    	rf.mu.Lock()
+            rf.currentState = LEADER
+            aerpc.Term = rf.currentTerm
+            aerpc.LeaderID = rf.me
+            rf.mu.Unlock()
+
+            var reply AppendEntriesReply
+			for i:=0; i < rf.peerCount;i++{
+				if i != rf.me{
+
+					rf.sendAppendEntries(i, &aerpc, &reply)
+					fmt.Println(rf.me,"send to",i,"leader rpc ok, term",rf.currentTerm)
+				}
+			}
+
+	    	return true
+	}
+
+
+	return true
 }
 
 func main_route(rf *Raft){
+    //每个term一开始就进入选举
+    //每个term 10分钟？
+
+	for {
+		timer := time.NewTimer(600 * time.Second) //term time
+		GoToElection(rf)
+		NewWork:
+		if rf.currentState==FOLLOWER {
+		loops:
+			for {
+				fmt.Println(rf.me, "go follower !, term:",rf.currentTerm)
+				rpctimer := time.NewTimer(100 * time.Millisecond)
+				select {
+				case <-timer.C:
+					//一个term结束，开始下一个term
+					break
+				case <-rpctimer.C:
+					//RPC timeout，continue进入选举准备
+					fmt.Println(rf.me, "follower rpc timeout! term:", rf.currentTerm)
+					break loops
+				case <-rf.rpcTimeoutChannel:
+					rpctimer.Reset(0)
+					continue
+				}
+			}
+
+		}else if rf.currentState==LEADER{
+			fmt.Println(rf.me, "leader go!term:",rf.currentTerm)
+			for {
+				rpctimer := time.NewTimer(130 * time.Millisecond)
+				select {
+				case <-timer.C:
+					//一个term结束，开始下一个term
+					break
+				case <-rpctimer.C:
+					//RPC timeout，发送rpc
+					var aerpc AppendEntriesArgs
+					//fmt.Println("go leader333",rf.me, rf.currentTerm)
+					//rf.currentState = LEADER
+					aerpc.Term = rf.currentTerm
+					aerpc.LeaderID = rf.me
+					fmt.Println("leader",rf.me, "send heartbreak rpc, term",rf.currentTerm)
+					var reply AppendEntriesReply
+					for i:=0; i < rf.peerCount;i++{
+						if i != rf.me{
+							if rf.sendAppendEntries(i, &aerpc, &reply){
+								if reply.Term > rf.currentTerm{
+									rf.mu.Lock()
+									rf.currentState = FOLLOWER
+									rf.currentTerm = reply.Term
+									rf.mu.Unlock()
+									goto NewWork
+								}
+
+							}
+
+						}
+					}
+				}
+			}
+		}
+	}
+
+
 
 }
 
 func GetRandNum() int{
 	r:=rand.New(rand.NewSource(time.Now().UnixNano()))
-	return r.Intn(230)
+//	fmt.Println("random ",300 + r.Intn(150))
+	return 300 +r.Intn(150)
 }
 //
 //fmt.Println()

@@ -308,7 +308,7 @@ func (cfg *config) checkOneLeader() int {
 				}
 			}
 		}
-
+		fmt.Println(" States info", leaders)
 		lastTermWithLeader := -1
 		for term, leaders := range leaders {
 			if len(leaders) > 1 {
@@ -318,7 +318,6 @@ func (cfg *config) checkOneLeader() int {
 				lastTermWithLeader = term
 			}
 		}
-
 		if len(leaders) != 0 {
 			return leaders[lastTermWithLeader][0]
 		}
