@@ -187,7 +187,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     //是否投票？
     //1.term是否比自己的大或者相等
     //2.日志比我新我才投票
+    fmt.Println(rf.me,"try to get lock to vote! state:",mapState(rf.currentState),"term:",rf.currentTerm)
      rf.mu.Lock()
+	fmt.Println("start vote!")
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -394,16 +396,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func GoToElection(rf *Raft){
 	//1. election clock, random value
+	fmt.Println(rf.me,"try to get vote lock",rf.currentTerm)
 	rf.mu.Lock()
 	rf.votedFor = 0
 	rf.mu.Unlock()
+	fmt.Println(rf.me,"finish get vote lock",rf.currentTerm)
 	//chf:= make(chan int)
 	//t := time.NewTimer(time.Duration(GetRandNum()) * time.Millisecond)
 	select {
 		case <-time.After(time.Duration(GetRandNum()) * time.Millisecond):
 			//定时器时间到了，没收到回复，转为candidate
 			for{
-				fmt.Println(rf.me,rf.currentTerm)
+				fmt.Println(rf.me,"go into candidate Election",rf.currentTerm)
 				if candidateElection(rf){
 					//收到新leader信息或者称为leader
 					fmt.Println(rf.me,"my State", mapState(rf.currentState))
@@ -511,7 +515,7 @@ func main_route(rf *Raft){
 		loops:
 			for {
 				fmt.Println(rf.me, "go follower !, term:",rf.currentTerm)
-				rpctimer := time.NewTimer(100 * time.Millisecond)
+				rpctimer := time.NewTimer(1000 * time.Millisecond)
 				select {
 				case <-timer.C:
 					//一个term结束，开始下一个term
@@ -547,6 +551,7 @@ func main_route(rf *Raft){
 						if i != rf.me{
 							if rf.sendAppendEntries(i, &aerpc, &reply){
 								if reply.Term > rf.currentTerm{
+									fmt.Println("leader",rf.me, "term is small, goto follower")
 									rf.mu.Lock()
 									rf.currentState = FOLLOWER
 									rf.currentTerm = reply.Term
@@ -570,7 +575,7 @@ func main_route(rf *Raft){
 func GetRandNum() int{
 	r:=rand.New(rand.NewSource(time.Now().UnixNano()))
 //	fmt.Println("random ",300 + r.Intn(150))
-	return 300 +r.Intn(150)
+	return 400 +r.Intn(150)
 }
 //
 //fmt.Println()
