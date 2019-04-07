@@ -427,12 +427,13 @@ func GoToElection(rf *Raft){
 //选举失败返回 false
 //成为follower或者成为leader 返回ok
 func candidateElection(rf * Raft) bool{
+	fmt.Println(rf.me,"tryto get candidate lock", rf.currentTerm)
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	rf.currentState = CANDIDATE
 	rf.votedFor = rf.me
 	rf.mu.Unlock()
-
+	fmt.Println(rf.me,"ok get candidate lock", rf.currentTerm)
 	//chf:= make(chan int)
 	//启动收集选票线程
 	electchan := make(chan int)
