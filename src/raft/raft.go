@@ -194,20 +194,40 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		rf.mu.Unlock()
-		fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock")
+		fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock4, candidate term:", args.Term)
 		return
 	}else if rf.votedFor != -1{
         //已经投过票
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		rf.mu.Unlock()
-		fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock,has vote for", rf.votedFor)
-		return
+
+        if rf.currentTerm==args.Term {
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = false
+			rf.mu.Unlock()
+			fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock,has vote for", rf.votedFor,"candidate term", args.Term)
+			return
+		}else if rf.currentTerm < args.Term && rf.currentTerm==CANDIDATE{
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = true
+			rf.currentState = FOLLOWER
+			rf.mu.Unlock()
+
+			fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock,has vote for", rf.votedFor,"candidate term", args.Term)
+			rf.electionTimerChannel <- 1
+			return
+		}else{// i' am follower and my term is small than args
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = true
+			rf.currentState = FOLLOWER
+			rf.mu.Unlock()
+			rf.rpcTimeoutChannel <- 1
+			fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock,has vote for", rf.votedFor,"candidate term", args.Term)
+			return
+		}
 	} else if args.LastLogIndex < rf.commitLogIndex{
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		rf.mu.Unlock()
-		fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock")
+		fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock3")
 		return
 	}else{
 		//正式投票
@@ -215,8 +235,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 
+		if rf.currentState==CANDIDATE{
+            rf.currentState=FOLLOWER
+			rf.mu.Unlock()
+            rf.electionTimerChannel <- 1
+			fmt.Println(rf.me,"term:",rf.currentTerm,"vote for",args.CandidateID, "----------------------------------unlock1, candidate term:",args.Term)
+            return
+		}
 		rf.mu.Unlock()
-		fmt.Println(rf.me,"term:",rf.currentTerm,"vote for",args.CandidateID, "----------------------------------unlock")
+
+		fmt.Println(rf.me,"term:",rf.currentTerm,"vote for",args.CandidateID, "----------------------------------unlock2,candidate term:",args.Term)
 		return
 	}
 }
@@ -474,7 +502,7 @@ func candidateElection(rf * Raft) bool{
 	electchan := make(chan int)
 	go func(rf *Raft, electchan chan int){
 		var rvags RequestVoteArgs
-        var reply RequestVoteReply
+
 		fmt.Println(rf.me,"go into election, currnet term:", rf.currentTerm,"---------------------------lock")
 		rf.mu.Lock()
 		rvags.Term = rf.currentTerm
@@ -484,35 +512,49 @@ func candidateElection(rf * Raft) bool{
 
 		rf.mu.Unlock()
 		fmt.Println(rf.me,"unlock go into election, currnet term:", rf.currentTerm,"---------------------------unlock")
-        reply.VoteGranted = false
-        reply.Term = 0
+
         //算上自己的一票。。。
 		voteCount:=1
 		//fmt.Println("go into vote",rf.me, rf.currentTerm)
 		for i:=0; i < rf.peerCount;i++{
-			if i != rf.me && rf.sendRequestVote(i, &rvags, &reply){
-				fmt.Println(rf.me, "recvone from",i, reply.VoteGranted,"term",reply.Term)
-				if reply.VoteGranted{
-					voteCount += 1
+			go func(rf *Raft, rvags *RequestVoteArgs, voteCount *int, i int){
+				var reply RequestVoteReply
+				reply.VoteGranted = false
+				reply.Term = 0
+				fmt.Println(rf.me, "ask recvone from",i,time.Now())
+				if i != rf.me && rf.sendRequestVote(i, rvags, &reply){
+					fmt.Println(rf.me, "recvone from",i, reply.VoteGranted,"term",reply.Term, time.Now())
+					if reply.VoteGranted {
+						rf.mu.Lock()
+						*voteCount += 1
+						rf.mu.Unlock()
+					}
+				}else{
+					if i!= rf.me{
+						fmt.Println(rf.me, "candidate recive ",i, "term",reply.Term, "wrong-----------no response")
+					}
 				}
-			}else{
-				if i!= rf.me{
-					fmt.Println(rf.me, "candidate recive ",i, "term",reply.Term, "wrong-----------no response")
-				}
-			}
 
-			if voteCount > rf.peerCount / 2{
-				//宣布当选
-				//fmt.Println("go leader1",rf.me, voteCount,rf.currentTerm)
-				electchan <- 1
-				//break
-			}
+				if *voteCount > rf.peerCount / 2{
+					//宣布当选
+					//fmt.Println(rf.me,"has enough vote!", voteCount,"term",rf.currentTerm)
+					electchan <- 1
+					//break
+				}
+			}(rf,&rvags,&voteCount,i)
 		}
+		//select{
+		//    case <-time.After(time.Duration(GetRandNum(rf.me) + 350) * time.Millisecond):
+		//	//定时器时间到了，没收到回复或者成功当选leader
+		//	fmt.Println(rf.me,"candidate time out", time.Now())
+		//	return
+		//}
+
 	}(rf, electchan)
 	select {
-		case <-time.After(time.Duration(GetRandNum(rf.me)) * time.Millisecond):
+		case <-time.After(time.Duration(GetRandNum(rf.me) + 350) * time.Millisecond):
 			//定时器时间到了，没收到回复或者成功当选leader
-			fmt.Println(rf.me,"candidate time out")
+			fmt.Println(rf.me,"candidate time out", time.Now())
 			return false
 		case <-rf.electionTimerChannel: //新增加一个关闭标志，如果是这个关闭，则直接return，推出协程
 			//1、收到投票信息并投出去了 2、收到新leader信息
