@@ -196,12 +196,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.mu.Unlock()
 		fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock")
 		return
-	}else if rf.votedFor != 0{
+	}else if rf.votedFor != -1{
         //已经投过票
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		rf.mu.Unlock()
-		fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock")
+		fmt.Println(rf.me,"try to get lock to vote for", args.CandidateID, " state:",mapState(rf.currentState),"term:",rf.currentTerm, "----------------------------------unlock,has vote for", rf.votedFor)
 		return
 	} else if args.LastLogIndex < rf.commitLogIndex{
 		reply.Term = rf.currentTerm
@@ -299,9 +299,9 @@ func (rf *Raft)AppendEntriesRPC ( args *AppendEntriesArgs, reply *AppendEntriesR
 		}else if rf.currentState == FOLLOWER{
 			//rf.currentState = FOLLOWER
 			rf.currentTerm = args.Term
-			rf.rpcTimeoutChannel <- 1
 			rf.mu.Unlock()
 			fmt.Println(rf.me,"state: FOLLOWER unlock recv append entries PRC from ", args.LeaderID,"---------------------------unlock")
+			rf.rpcTimeoutChannel <- 1
 			return
 		}else if rf.currentState == LEADER{ //是否要term大于自己才转换？理论上应该是，但是选举确保新leader应该term大于老leader，分区?不够数量当选
 			//leader应该变为follower并且要发送给leader循环
@@ -393,7 +393,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentState = FOLLOWER // 1:follower 2: leader  2:candidate
 	rf.currentTerm = 0
 	//isLeader bool    //自己是不是leader
-	rf.votedFor = 0  //当前term已经投票的候选人，在新的term应该要先置空
+	rf.votedFor = -1  //当前term已经投票的候选人，在新的term应该要先置空
 	rf.peerCount = len(peers)  //总共有多少结点
 	 //暂时不用
 	rf.commitLogIndex = 0 //已经commit的日志的index
@@ -433,16 +433,16 @@ func GoToElection(rf *Raft){
 	//1. election clock, random value
 	fmt.Println(rf.me,"try to get vote lock to be candidate, term",rf.currentTerm,"---------------------------lock")
 	rf.mu.Lock()
-	rf.votedFor = 0
+	rf.votedFor = -1
 	rf.mu.Unlock()
 	fmt.Println(rf.me,"finish get vote lock to be candidate",rf.currentTerm,"---------------------------unlock")
 	//chf:= make(chan int)
 	//t := time.NewTimer(time.Duration(GetRandNum()) * time.Millisecond)
 	select {
-		case <-time.After(time.Duration(GetRandNum()) * time.Millisecond):
+		case <-time.After(time.Duration(GetRandNum(rf.me) * 5) * time.Millisecond):
 			//定时器时间到了，没收到回复，转为candidate
 			for{
-				fmt.Println(rf.me,"go into candidate Election",rf.currentTerm)
+				fmt.Println(rf.me,"go into candidate Election",rf.currentTerm, time.Now())
 				if candidateElection(rf){
 					//收到新leader信息或者称为leader
 					fmt.Println(rf.me,"my State", mapState(rf.currentState))
@@ -510,7 +510,7 @@ func candidateElection(rf * Raft) bool{
 		}
 	}(rf, electchan)
 	select {
-		case <-time.After(time.Duration(GetRandNum()) * time.Millisecond):
+		case <-time.After(time.Duration(GetRandNum(rf.me)) * time.Millisecond):
 			//定时器时间到了，没收到回复或者成功当选leader
 			fmt.Println(rf.me,"candidate time out")
 			return false
@@ -560,7 +560,7 @@ func candidateElection(rf * Raft) bool{
 func main_route(rf *Raft){
     //每个term一开始就进入选举
     //每个term 10分钟？
-    time.Sleep(time.Duration(GetRandNum())*time.Millisecond)
+    time.Sleep(time.Duration(GetRandNum(rf.me))*time.Millisecond)
 	for {
 		timer := time.NewTimer(600 * time.Second) //term time
 		GoToElection(rf)
@@ -639,10 +639,17 @@ func main_route(rf *Raft){
 
 }
 
-func GetRandNum() int{
-	r:=rand.New(rand.NewSource(time.Now().UnixNano()))
+func GetRandNum(peerNumber int) int{
+//	r:=rand.New(rand.NewSource(time.Now().UnixNano()))
 //	fmt.Println("random ",300 + r.Intn(150))
-	return 400 +r.Intn(150)
+	//k:= 100 +r.Intn(350)
+	t1:=time.Now().UnixNano()//取到当前时间，精确到纳秒
+	//时间戳：当前的时间，距离1970年1月1日0点0分0秒的秒值，纳秒值
+	rand.Seed(t1)//把当前时间作为种子传给计算机
+
+	k:= 150 + rand.Intn(100 + peerNumber*100) + peerNumber * 50
+    fmt.Println("random:",k)
+	return k
 }
 //
 //fmt.Println()
